@@ -129,6 +129,8 @@ Essential npm commands for development and distribution:
 | `npm run dev`                    | Start dev server with hot reload and Electron                            |
 | `npm run build`                  | Create production build                                                  |
 | `npm run package-widgets`        | Bundle widgets for distribution                                          |
+| `npm run package-zip`            | Bundle + create distributable ZIP for registry                           |
+| `npm run publish-to-registry`    | Publish widget package to the Dash Registry                              |
 | `npm run package`                | Create Mac .dmg distributable (requires XCode & Apple Developer account) |
 | `npm run widgetize <WidgetName>` | Generate widget scaffold in src/Widgets                                  |
 
@@ -395,6 +397,33 @@ See [dash-react documentation](../dash-react/README.md#component-overview) for f
     ```
 
 A GitHub workflow automatically publishes the package.
+
+### Publishing to the Dash Registry
+
+1. Bundle and create a ZIP:
+    ```bash
+    npm run package-zip
+    ```
+2. Publish to the registry:
+    ```bash
+    npm run publish-to-registry
+    ```
+
+#### Monorepo: Packaging a Specific Widget Folder
+
+If your project has multiple widget folders under `src/Widgets/`, use the `--package` flag to target a specific one:
+
+```bash
+npm run package-zip -- --package Clock
+npm run publish-to-registry -- --package Clock
+```
+
+This collects `.dash.js` configs only from `src/Widgets/Clock/` while still including the full Rollup bundle. Other available flags for `publish-to-registry`:
+
+-   `--dry-run` — Preview the manifest without opening a PR
+-   `--name custom` — Override the registry package name
+-   `--github-user me` — Override the GitHub username
+-   `--all` — Publish all widget folders
 
 ### Using External Widget Packages
 

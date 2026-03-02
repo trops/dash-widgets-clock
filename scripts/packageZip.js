@@ -13,6 +13,9 @@
  * 4. Bundles everything into a ZIP file in the project root
  *
  * Output: {package-name}-v{version}.zip
+ *
+ * Flags:
+ *   --package <name>  Only include configs from src/Widgets/<name>/ (e.g., --package Clock)
  */
 
 const fs = require("fs");
@@ -20,9 +23,15 @@ const path = require("path");
 const AdmZip = require("adm-zip");
 const { validatePackage, validateZip } = require("./validateWidget.cjs");
 
+const args = process.argv.slice(2);
+const packageIdx = args.indexOf("--package");
+const targetPackage = packageIdx !== -1 ? args[packageIdx + 1] : null;
+
 const ROOT = path.resolve(__dirname, "..");
 const DIST_DIR = path.join(ROOT, "dist");
-const WIDGETS_DIR = path.join(ROOT, "src", "Widgets");
+const WIDGETS_DIR = targetPackage
+    ? path.join(ROOT, "src", "Widgets", targetPackage)
+    : path.join(ROOT, "src", "Widgets");
 
 function collectDashConfigs(dir) {
     const configs = [];

@@ -22,6 +22,33 @@ npm run package-widgets
 This compiles your widgets from `src/Widgets/` into distributable bundles that can
 be consumed by other Dash projects as npm packages.
 
+### Creating a ZIP Package
+
+To create a distributable ZIP (for registry publishing):
+
+```bash
+npm run package-zip
+```
+
+This runs `package-widgets` then generates a ZIP with the bundle, `.dash.js` configs,
+and `dash.json` metadata.
+
+### Monorepo: Packaging a Specific Widget Folder
+
+If your project has multiple widget folders under `src/Widgets/`, you can package
+only a specific one using the `--package` flag:
+
+```bash
+npm run package-zip -- --package Clock
+```
+
+This collects `.dash.js` configs only from `src/Widgets/Clock/` while still including
+the full Rollup bundle. The same flag works with `publish-to-registry`:
+
+```bash
+npm run publish-to-registry -- --package Clock
+```
+
 ---
 
 ## 2. Publishing as an npm Package
