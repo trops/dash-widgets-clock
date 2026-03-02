@@ -226,10 +226,10 @@ function main() {
 
     addDirectory(DIST_DIR, "");
 
-    // Add .dash.js config files
+    // Add .dash.js config files (flattened into configs/ so findWidgetsDir can discover them)
     for (const configPath of dashConfigPaths) {
-        const relativePath = path.relative(WIDGETS_DIR, configPath);
-        zip.addFile(`configs/${relativePath}`, fs.readFileSync(configPath));
+        const fileName = path.basename(configPath);
+        zip.addFile(`configs/${fileName}`, fs.readFileSync(configPath));
     }
 
     // Add dash.json
