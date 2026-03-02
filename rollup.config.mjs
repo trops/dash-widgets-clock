@@ -55,7 +55,14 @@ const PLUGINS = [
     strip(),
 ];
 
-const EXTERNAL = ["react", "react-dom", "prop-types"];
+const EXTERNAL = [
+    "react",
+    "react-dom",
+    "prop-types",
+    "@trops/dash-core",
+    "@trops/dash-react",
+    "react/jsx-runtime",
+];
 
 // https://github.com/rollup/plugins/tree/master/packages/babel#babelhelpers
 const CJS_AND_ES_EXTERNALS = EXTERNAL.concat(/@babel\/runtime/);
@@ -77,14 +84,13 @@ const isProduction =
 const config = OUTPUT_DATA.map(({ file, format }) => ({
     input: INPUT_FILE_PATH,
     output: {
-        dir: "dist",
+        ...(format === "cjs"
+            ? { file: "dist/index.cjs.js" }
+            : { dir: "dist" }),
         sourcemap: !isProduction,
-        //file,
-        //dir: "dist",
         format,
         name: OUTPUT_NAME,
         globals: GLOBALS,
-        // exports: "named"
     },
     plugins: PLUGINS,
     external: ["cjs", "es"].includes(format) ? CJS_AND_ES_EXTERNALS : EXTERNAL,
