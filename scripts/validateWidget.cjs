@@ -30,6 +30,8 @@ const KEBAB_CASE_RE = /^[a-z][a-z0-9]*(-[a-z0-9]+)*$/;
 const PASCAL_CASE_RE = /^[A-Z][a-zA-Z0-9]*$/;
 const SEMVER_RE = /^\d+\.\d+\.\d+(-[a-zA-Z0-9.]+)?$/;
 const ISO_8601_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/;
+const GITHUB_USER_RE = /^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$/;
+const WIDGET_ID_RE = /^[a-zA-Z0-9-]+\.[a-zA-Z0-9-]+\.[A-Z][a-zA-Z0-9]*$/;
 
 const VALID_CATEGORIES = [
     "general",
@@ -63,8 +65,19 @@ function validateManifestSchema(manifest) {
     }
 
     // --- Required string fields ---
+    // Support both "githubUser" (new) and "scope" (legacy) for backward compat
+    const hasGithubUser =
+        typeof manifest.githubUser === "string" && manifest.githubUser.trim();
+    const hasScope =
+        typeof manifest.scope === "string" && manifest.scope.trim();
+
+    if (!hasGithubUser && !hasScope) {
+        errors.push(
+            `"githubUser" is required and must be a non-empty string (GitHub username used for identity)`
+        );
+    }
+
     const requiredStrings = [
-        "scope",
         "name",
         "displayName",
         "author",
@@ -72,7 +85,6 @@ function validateManifestSchema(manifest) {
         "version",
         "category",
         "downloadUrl",
-        "repository",
     ];
 
     for (const field of requiredStrings) {
@@ -83,12 +95,28 @@ function validateManifestSchema(manifest) {
         }
     }
 
-    // --- scope format ---
-    if (
-        typeof manifest.scope === "string" &&
-        manifest.scope.trim() &&
-        !KEBAB_CASE_RE.test(manifest.scope)
-    ) {
+    // --- repository (optional) ---
+    // Repository is no longer required — publishing without a separate repo is supported
+    if (typeof manifest.repository === "string" && manifest.repository.trim()) {
+        if (
+            !manifest.repository.startsWith("https://") &&
+            !manifest.repository.startsWith("http://")
+        ) {
+            warnings.push(
+                `"repository" should be a full URL (got "${manifest.repository}")`
+            );
+        }
+    }
+
+    // --- githubUser format ---
+    if (hasGithubUser && !GITHUB_USER_RE.test(manifest.githubUser)) {
+        errors.push(
+            `"githubUser" must be a valid GitHub username (got "${manifest.githubUser}"). Pattern: letters, digits, hyphens`
+        );
+    }
+
+    // --- scope format (legacy backward compat) ---
+    if (hasScope && !hasGithubUser && !KEBAB_CASE_RE.test(manifest.scope)) {
         errors.push(
             `"scope" must be kebab-case (got "${manifest.scope}"). Example: "my-username"`
         );
@@ -141,18 +169,6 @@ function validateManifestSchema(manifest) {
         }
     }
 
-    // --- repository URL ---
-    if (typeof manifest.repository === "string" && manifest.repository.trim()) {
-        if (
-            !manifest.repository.startsWith("https://") &&
-            !manifest.repository.startsWith("http://")
-        ) {
-            warnings.push(
-                `"repository" should be a full URL (got "${manifest.repository}")`
-            );
-        }
-    }
-
     // --- tags (optional) ---
     if (manifest.tags !== undefined) {
         if (!Array.isArray(manifest.tags)) {
@@ -184,6 +200,9 @@ function validateManifestSchema(manifest) {
     } else if (manifest.widgets.length === 0) {
         errors.push(`"widgets" must contain at least one widget entry`);
     } else {
+        const githubUser = manifest.githubUser || manifest.scope;
+        const packageName = manifest.name;
+
         manifest.widgets.forEach((widget, i) => {
             const prefix = `widgets[${i}]`;
 
@@ -195,6 +214,27 @@ function validateManifestSchema(manifest) {
                 warnings.push(
                     `${prefix}.name should be PascalCase (got "${widget.name}")`
                 );
+            }
+
+            // --- id validation (optional but validated if present) ---
+            if (widget.id !== undefined) {
+                if (typeof widget.id !== "string" || !widget.id.trim()) {
+                    errors.push(
+                        `${prefix}.id must be a non-empty string if provided`
+                    );
+                } else if (!WIDGET_ID_RE.test(widget.id)) {
+                    errors.push(
+                        `${prefix}.id must match "{githubUser}.{package}.{widgetName}" format (got "${widget.id}")`
+                    );
+                } else if (githubUser && packageName && widget.name) {
+                    // Verify id components match manifest fields
+                    const expectedId = `${githubUser}.${packageName}.${widget.name}`;
+                    if (widget.id !== expectedId) {
+                        errors.push(
+                            `${prefix}.id mismatch: expected "${expectedId}" but got "${widget.id}"`
+                        );
+                    }
+                }
             }
 
             if (
@@ -264,22 +304,51 @@ function validateManifestSchema(manifest) {
 function parseDashConfig(configPath) {
     try {
         const source = fs.readFileSync(configPath, "utf8");
-        const exportMatch = source.match(
-            /export\s+default\s+({[\s\S]*});?\s*$/
-        );
 
-        if (!exportMatch) {
+        // Try direct export: export default { ... }
+        let exportMatch = source.match(/export\s+default\s+({[\s\S]*});?\s*$/);
+
+        let exportedObjectStr;
+
+        if (exportMatch) {
+            exportedObjectStr = exportMatch[1];
+        } else {
+            // Try variable export: const/let/var name = { ... }; export default name;
+            const varExportMatch = source.match(
+                /export\s+default\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*;?\s*$/
+            );
+            if (varExportMatch) {
+                const varName = varExportMatch[1];
+                // Find the variable declaration with object literal
+                const varDeclMatch = source.match(
+                    new RegExp(
+                        `(?:const|let|var)\\s+${varName}\\s*=\\s*({[\\s\\S]*?});\\s*(?:export\\s+default)`
+                    )
+                );
+                if (varDeclMatch) {
+                    exportedObjectStr = varDeclMatch[1];
+                }
+            }
+        }
+
+        if (!exportedObjectStr) {
             return {
                 config: null,
                 error: "Could not find `export default {...}` in config file",
             };
         }
 
-        const exportedObjectStr = exportMatch[1];
+        // Strip import references (component: SomeWidget) that vm can't resolve
+        // Replace component references with a placeholder string
+        const sanitized = exportedObjectStr.replace(
+            /component\s*:\s*([A-Z][a-zA-Z0-9_$]*)/g,
+            'component: "$1"'
+        );
+
         const context = vm.createContext({ module: { exports: {} } });
 
         try {
-            vm.runInContext(`module.exports = ${exportedObjectStr}`, context);
+            vm.runInContext(`module.exports = ${sanitized}`, context);
         } catch (vmErr) {
             // Most common cause: config references a component import that
             // can't be resolved outside the bundled runtime.
@@ -508,6 +577,228 @@ function cleanup(dir) {
 }
 
 // ---------------------------------------------------------------------------
+// Package validation (pre-build and post-build checks)
+// ---------------------------------------------------------------------------
+
+/**
+ * Validate widget source files before building.
+ * Checks .dash.js configs, matching component files, and package.json.
+ *
+ * @param {string} widgetsDir - Path to src/Widgets/ directory
+ * @param {Object} packageJson - Parsed package.json object
+ * @returns {{ errors: string[], warnings: string[] }}
+ */
+function validatePackage(widgetsDir, packageJson) {
+    const errors = [];
+    const warnings = [];
+
+    // --- package.json checks ---
+    if (!packageJson.name) {
+        errors.push('package.json is missing required "name" field');
+    }
+    if (!packageJson.version) {
+        errors.push('package.json is missing required "version" field');
+    }
+
+    if (!fs.existsSync(widgetsDir)) {
+        errors.push(`Widgets directory not found: ${widgetsDir}`);
+        return { errors, warnings };
+    }
+
+    // Collect all .dash.js configs recursively
+    function collectConfigs(dir) {
+        const results = [];
+        if (!fs.existsSync(dir)) return results;
+        const entries = fs.readdirSync(dir, { withFileTypes: true });
+        for (const entry of entries) {
+            const fullPath = path.join(dir, entry.name);
+            if (entry.isDirectory()) {
+                results.push(...collectConfigs(fullPath));
+            } else if (entry.name.endsWith(".dash.js")) {
+                results.push(fullPath);
+            }
+        }
+        return results;
+    }
+
+    const configPaths = collectConfigs(widgetsDir);
+
+    if (configPaths.length === 0) {
+        errors.push("No .dash.js config files found in widgets directory");
+        return { errors, warnings };
+    }
+
+    const widgetNames = [];
+
+    for (const configPath of configPaths) {
+        const fileName = path.basename(configPath, ".dash.js");
+        const configDir = path.dirname(configPath);
+
+        // Parse the config
+        const { config, error } = parseDashConfig(configPath);
+
+        if (error) {
+            if (error.includes("component import reference")) {
+                // Config references component import — check fields via regex instead
+                const source = fs.readFileSync(configPath, "utf8");
+                const hasName = /name\s*:\s*["']/.test(source);
+                const hasDisplayName = /displayName\s*:\s*["']/.test(source);
+                const hasType = /type\s*:\s*["']/.test(source);
+                if (!hasName)
+                    warnings.push(`${fileName}.dash.js: missing "name" field`);
+                if (!hasDisplayName)
+                    warnings.push(
+                        `${fileName}.dash.js: missing "displayName" field`
+                    );
+                if (!hasType)
+                    warnings.push(`${fileName}.dash.js: missing "type" field`);
+            } else {
+                errors.push(`${fileName}.dash.js: ${error}`);
+                continue;
+            }
+        }
+
+        if (config) {
+            // Required fields
+            if (!config.name) {
+                errors.push(
+                    `${fileName}.dash.js: missing required "name" field`
+                );
+            }
+            if (!config.displayName) {
+                errors.push(
+                    `${fileName}.dash.js: missing required "displayName" field`
+                );
+            }
+            if (!config.type) {
+                errors.push(
+                    `${fileName}.dash.js: missing required "type" field`
+                );
+            }
+
+            // Track names for duplicate detection
+            const widgetName = config.name || fileName;
+            widgetNames.push({ name: widgetName, file: configPath });
+        }
+
+        // Check for matching component .js file
+        const componentFile = path.join(configDir, `${fileName}.js`);
+        if (!fs.existsSync(componentFile)) {
+            warnings.push(
+                `${fileName}.dash.js has no matching component file ${fileName}.js`
+            );
+        }
+    }
+
+    // Check for duplicate widget names
+    const nameCount = {};
+    for (const { name, file } of widgetNames) {
+        if (nameCount[name]) {
+            errors.push(
+                `Duplicate widget name "${name}" found in ${path.basename(
+                    nameCount[name]
+                )} and ${path.basename(file)}`
+            );
+        } else {
+            nameCount[name] = file;
+        }
+    }
+
+    return { errors, warnings };
+}
+
+/**
+ * Validate a built ZIP file for structure and size.
+ *
+ * @param {string} zipPath - Path to the ZIP file
+ * @returns {{ errors: string[], warnings: string[] }}
+ */
+function validateZip(zipPath) {
+    const errors = [];
+    const warnings = [];
+
+    if (!fs.existsSync(zipPath)) {
+        errors.push(`ZIP file not found: ${zipPath}`);
+        return { errors, warnings };
+    }
+
+    const stats = fs.statSync(zipPath);
+    const sizeMB = stats.size / (1024 * 1024);
+
+    // Size checks
+    if (sizeMB > 50) {
+        errors.push(
+            `ZIP file is too large: ${sizeMB.toFixed(1)} MB (max 50 MB)`
+        );
+    } else if (sizeMB > 5) {
+        warnings.push(`ZIP file is large: ${sizeMB.toFixed(1)} MB (> 5 MB)`);
+    }
+
+    // Structure checks
+    try {
+        const AdmZip = require("adm-zip");
+        const zip = new AdmZip(zipPath);
+        const entries = zip.getEntries().map((e) => e.entryName);
+
+        // Check for dash.json
+        if (!entries.includes("dash.json")) {
+            errors.push("ZIP is missing dash.json");
+        }
+
+        // Check for configs/ directory
+        const hasConfigs = entries.some((e) => e.startsWith("configs/"));
+        if (!hasConfigs) {
+            errors.push("ZIP is missing configs/ directory");
+        }
+
+        // Check for bundled JS files
+        const hasBundle = entries.some(
+            (e) =>
+                (e.endsWith(".cjs.js") || e.endsWith(".mjs")) &&
+                !e.startsWith("configs/")
+        );
+        if (!hasBundle) {
+            warnings.push(
+                "ZIP does not contain any bundled JS files (.cjs.js or .mjs)"
+            );
+        }
+
+        // Cross-check dash.json widgets vs config files
+        const dashJsonEntry = zip.getEntry("dash.json");
+        if (dashJsonEntry) {
+            try {
+                const dashJson = JSON.parse(
+                    dashJsonEntry.getData().toString("utf8")
+                );
+                if (dashJson.widgets && Array.isArray(dashJson.widgets)) {
+                    const configFiles = entries
+                        .filter(
+                            (e) =>
+                                e.startsWith("configs/") &&
+                                e.endsWith(".dash.js")
+                        )
+                        .map((e) => path.basename(e, ".dash.js"));
+
+                    for (const widget of dashJson.widgets) {
+                        if (widget.name && !configFiles.includes(widget.name)) {
+                            warnings.push(
+                                `dash.json widget "${widget.name}" has no matching config file in configs/`
+                            );
+                        }
+                    }
+                }
+            } catch {
+                errors.push("dash.json is not valid JSON");
+            }
+        }
+    } catch (zipErr) {
+        errors.push(`Failed to read ZIP: ${zipErr.message}`);
+    }
+
+    return { errors, warnings };
+}
+
+// ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
@@ -524,10 +815,61 @@ async function main() {
 
     const isFull = flags.includes("--full");
     const isJson = flags.includes("--json");
+    const isPackage = flags.includes("--package");
 
+    // --- Package validation mode ---
+    if (isPackage) {
+        const ROOT = path.resolve(__dirname, "..");
+        const widgetsDir = path.join(ROOT, "src", "Widgets");
+        const pkgPath = path.join(ROOT, "package.json");
+
+        if (!fs.existsSync(pkgPath)) {
+            console.error(`${RED}ERROR: package.json not found${RESET}`);
+            process.exit(1);
+        }
+
+        const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+        console.log(
+            `\n${BLUE}Validating package: ${pkg.name || "unknown"}${RESET}\n`
+        );
+
+        const result = validatePackage(widgetsDir, pkg);
+
+        if (result.errors.length > 0) {
+            for (const e of result.errors) {
+                console.log(`  ${RED}ERROR: ${e}${RESET}`);
+            }
+        }
+        if (result.warnings.length > 0) {
+            for (const w of result.warnings) {
+                console.log(`  ${YELLOW}WARNING: ${w}${RESET}`);
+            }
+        }
+
+        console.log("");
+
+        if (result.errors.length === 0 && result.warnings.length === 0) {
+            console.log(`${GREEN}PASSED — package validation passed${RESET}`);
+        } else if (result.errors.length === 0) {
+            console.log(
+                `${YELLOW}PASSED with ${result.warnings.length} warning(s)${RESET}`
+            );
+        } else {
+            console.log(
+                `${RED}FAILED — ${result.errors.length} error(s), ${result.warnings.length} warning(s)${RESET}`
+            );
+        }
+
+        process.exit(result.errors.length > 0 ? 1 : 0);
+        return;
+    }
+
+    // --- Manifest validation mode ---
     if (positional.length === 0) {
         console.error(
-            "Usage: node scripts/validateWidget.cjs <manifest.json> [--full] [--json]"
+            "Usage:\n" +
+                "  node scripts/validateWidget.cjs <manifest.json> [--full] [--json]\n" +
+                "  node scripts/validateWidget.cjs --package"
         );
         process.exit(1);
     }
@@ -633,7 +975,13 @@ async function main() {
 // Exports (for programmatic use by publishToRegistry.js)
 // ---------------------------------------------------------------------------
 
-module.exports = { validateManifestSchema, validateFull, parseDashConfig };
+module.exports = {
+    validateManifestSchema,
+    validateFull,
+    parseDashConfig,
+    validatePackage,
+    validateZip,
+};
 
 // Run CLI if invoked directly
 if (require.main === module) {

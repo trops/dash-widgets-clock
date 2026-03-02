@@ -18,6 +18,7 @@
 const fs = require("fs");
 const path = require("path");
 const AdmZip = require("adm-zip");
+const { validatePackage, validateZip } = require("./validateWidget.cjs");
 
 const ROOT = path.resolve(__dirname, "..");
 const DIST_DIR = path.join(ROOT, "dist");
@@ -114,6 +115,25 @@ function parseDashConfig(filePath) {
 }
 
 function main() {
+    // Read package.json
+    const pkg = JSON.parse(
+        fs.readFileSync(path.join(ROOT, "package.json"), "utf8")
+    );
+
+    // --- Pre-build validation ---
+    console.log("Running pre-build validation...");
+    const preValidation = validatePackage(WIDGETS_DIR, pkg);
+    if (preValidation.errors.length > 0) {
+        console.error("\nPre-build validation failed:");
+        preValidation.errors.forEach((e) => console.error(`  ERROR: ${e}`));
+        preValidation.warnings.forEach((w) => console.warn(`  WARNING: ${w}`));
+        process.exit(1);
+    }
+    if (preValidation.warnings.length > 0) {
+        preValidation.warnings.forEach((w) => console.warn(`  WARNING: ${w}`));
+    }
+    console.log("Pre-build validation passed.\n");
+
     // Verify dist/ exists
     if (!fs.existsSync(DIST_DIR)) {
         console.error(
@@ -127,11 +147,6 @@ function main() {
         console.error("Error: dist/ directory is empty.");
         process.exit(1);
     }
-
-    // Read package.json
-    const pkg = JSON.parse(
-        fs.readFileSync(path.join(ROOT, "package.json"), "utf8")
-    );
     const packageName = (pkg.name || "widgets").replace(/^@[^/]+\//, "");
     const version = pkg.version || "0.0.0";
 
@@ -140,16 +155,25 @@ function main() {
     const widgets = [];
     const workspaces = [];
 
+    // Read githubUser for stamping widget IDs (if cached from publish)
+    const githubUser =
+        pkg.dash && pkg.dash.githubUser ? pkg.dash.githubUser : null;
+
     for (const configPath of dashConfigPaths) {
         const config = parseDashConfig(configPath);
         if (config.type === "widget") {
-            widgets.push({
+            const widgetEntry = {
                 name: config.name,
                 displayName: config.displayName,
                 description: config.description,
                 icon: config.icon,
                 providers: config.providers,
-            });
+            };
+            // Stamp scoped id if githubUser is available
+            if (githubUser) {
+                widgetEntry.id = `${githubUser}.${packageName}.${config.name}`;
+            }
+            widgets.push(widgetEntry);
         } else if (config.type === "workspace") {
             workspaces.push({
                 name: config.name,
@@ -222,6 +246,20 @@ function main() {
     );
     console.log(`  Version: ${version}`);
     console.log(`  Size: ${(fs.statSync(zipPath).size / 1024).toFixed(1)} KB`);
+
+    // --- Post-build validation ---
+    console.log("\nRunning post-build validation...");
+    const postValidation = validateZip(zipPath);
+    if (postValidation.errors.length > 0) {
+        console.error("\nPost-build validation failed:");
+        postValidation.errors.forEach((e) => console.error(`  ERROR: ${e}`));
+        postValidation.warnings.forEach((w) => console.warn(`  WARNING: ${w}`));
+        process.exit(1);
+    }
+    if (postValidation.warnings.length > 0) {
+        postValidation.warnings.forEach((w) => console.warn(`  WARNING: ${w}`));
+    }
+    console.log("Post-build validation passed.");
 }
 
 main();
