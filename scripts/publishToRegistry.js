@@ -8,31 +8,60 @@
  * What it does:
  * 1. Scans src/Widgets/ for all .dash.js config files
  * 2. Reads metadata from each (name, author, description, icon, version, providers, etc.)
- * 3. Reads package.json for package-level info (name, version, author, repository)
- * 4. Generates a manifest.json conforming to the registry schema
- * 5. Uses `gh` CLI to fork dash-registry, create a branch, write manifest, and open a PR
+ * 3. Detects GitHub username via cascade (cached → gh CLI → GitHub API → git remote → prompt)
+ * 4. Stamps scoped widget IDs: {githubUser}.{package}.{widgetName}
+ * 5. Generates a manifest.json conforming to the registry schema
+ * 6. Uploads ZIP to trops/dash-registry releases (no separate repo required)
+ * 7. Uses `gh` CLI to fork dash-registry, create a branch, write manifest, and open a PR
  *
  * Prerequisites:
  * - `gh` CLI installed and authenticated (`gh auth login`)
- * - `npm run package-zip` script available (the script builds and uploads the ZIP automatically)
+ * - `npm run package-zip` script available
  *
  * Usage:
  *   npm run publish-to-registry
- *   npm run publish-to-registry -- --dry-run    # Preview manifest without opening PR
+ *   npm run publish-to-registry -- --dry-run        # Preview manifest without opening PR
+ *   npm run publish-to-registry -- --name custom     # Custom registry name
+ *   npm run publish-to-registry -- --github-user me  # Override GitHub username
+ *   npm run publish-to-registry -- --package Clock   # Publish specific package (monorepo)
+ *   npm run publish-to-registry -- --all             # Publish all packages (monorepo)
  */
 
 const fs = require("fs");
 const path = require("path");
 const { execSync } = require("child_process");
+const readline = require("readline");
 
 const ROOT = path.resolve(__dirname, "..");
 const WIDGETS_DIR = path.join(ROOT, "src", "Widgets");
 const REGISTRY_REPO = "trops/dash-registry";
 
+// Folders to skip when scanning for publishable widget packages
+const EXCLUDED_DIRS = new Set(["DashSamples"]);
+
+const GITHUB_USER_RE = /^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$/;
+const GENERIC_USERNAMES = new Set([
+    "your name",
+    "username",
+    "user",
+    "root",
+    "admin",
+    "",
+]);
+
 const args = process.argv.slice(2);
 const isDryRun = args.includes("--dry-run");
 const nameIdx = args.indexOf("--name");
 const customName = nameIdx !== -1 ? args[nameIdx + 1] : null;
+const ghUserIdx = args.indexOf("--github-user");
+const ghUserOverride = ghUserIdx !== -1 ? args[ghUserIdx + 1] : null;
+const packageIdx = args.indexOf("--package");
+const targetPackage = packageIdx !== -1 ? args[packageIdx + 1] : null;
+const publishAll = args.includes("--all");
+
+// ---------------------------------------------------------------------------
+// Utilities
+// ---------------------------------------------------------------------------
 
 function toKebabCase(str) {
     return str
@@ -49,6 +78,31 @@ function toTitleCase(kebab) {
         .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
         .join(" ");
 }
+
+function exec(cmd) {
+    try {
+        return execSync(cmd, { encoding: "utf8", stdio: "pipe" }).trim();
+    } catch (error) {
+        return null;
+    }
+}
+
+function prompt(question) {
+    const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout,
+    });
+    return new Promise((resolve) => {
+        rl.question(question, (answer) => {
+            rl.close();
+            resolve(answer.trim());
+        });
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Config collection and parsing
+// ---------------------------------------------------------------------------
 
 function collectDashConfigs(dir) {
     const configs = [];
@@ -133,13 +187,138 @@ function parseDashConfig(filePath) {
     };
 }
 
-function exec(cmd) {
-    try {
-        return execSync(cmd, { encoding: "utf8", stdio: "pipe" }).trim();
-    } catch (error) {
-        return null;
+// ---------------------------------------------------------------------------
+// GitHub username detection cascade
+// ---------------------------------------------------------------------------
+
+/**
+ * Detect the GitHub username via a prioritized cascade:
+ * 1. --github-user CLI flag
+ * 2. Cached value in package.json "dash.githubUser"
+ * 3. gh CLI: `gh api user --jq .login`
+ * 4. GitHub API + PAT: curl with $GITHUB_TOKEN
+ * 5. Git remote URL: parse owner from github.com:{owner}/repo
+ * 6. Interactive prompt
+ *
+ * After detection, verifies the username exists on GitHub.
+ * Caches the result in package.json under "dash.githubUser".
+ */
+async function detectGithubUser(pkg, pkgPath) {
+    let githubUser = null;
+    let source = null;
+
+    // 1. CLI override
+    if (ghUserOverride) {
+        githubUser = ghUserOverride;
+        source = "--github-user flag";
     }
+
+    // 2. Cached value in package.json
+    if (!githubUser && pkg.dash && pkg.dash.githubUser) {
+        githubUser = pkg.dash.githubUser;
+        source = "package.json dash.githubUser (cached)";
+    }
+
+    // 3. gh CLI
+    if (!githubUser) {
+        const ghLogin = exec("gh api user --jq .login 2>/dev/null");
+        if (ghLogin) {
+            githubUser = ghLogin;
+            source = "gh CLI (gh api user)";
+        }
+    }
+
+    // 4. GitHub API + PAT
+    if (!githubUser && process.env.GITHUB_TOKEN) {
+        const apiResult = exec(
+            `curl -s -H "Authorization: token ${process.env.GITHUB_TOKEN}" https://api.github.com/user 2>/dev/null`
+        );
+        if (apiResult) {
+            try {
+                const userData = JSON.parse(apiResult);
+                if (userData.login) {
+                    githubUser = userData.login;
+                    source = "GitHub API (GITHUB_TOKEN)";
+                }
+            } catch {
+                // Ignore parse errors
+            }
+        }
+    }
+
+    // 5. Git remote URL
+    if (!githubUser) {
+        const remoteUrl = exec("git remote get-url origin 2>/dev/null");
+        if (remoteUrl) {
+            // Match github.com:{owner}/repo or github.com/{owner}/repo
+            const match = remoteUrl.match(/github\.com[:/]([^/]+)\//);
+            if (match) {
+                const candidate = match[1];
+                console.log(
+                    `\nDetected GitHub user "${candidate}" from git remote URL.`
+                );
+                const confirm = await prompt(
+                    `Is "${candidate}" your GitHub username? (y/n): `
+                );
+                if (
+                    confirm.toLowerCase() === "y" ||
+                    confirm.toLowerCase() === "yes"
+                ) {
+                    githubUser = candidate;
+                    source = "git remote URL";
+                }
+            }
+        }
+    }
+
+    // 6. Interactive prompt
+    if (!githubUser) {
+        githubUser = await prompt("Enter your GitHub username: ");
+        source = "interactive prompt";
+    }
+
+    // Validation
+    if (!githubUser || GENERIC_USERNAMES.has(githubUser.toLowerCase())) {
+        console.error(`Error: Invalid GitHub username: "${githubUser || ""}"`);
+        process.exit(1);
+    }
+
+    if (!GITHUB_USER_RE.test(githubUser)) {
+        console.error(
+            `Error: GitHub username "${githubUser}" doesn't match expected format (letters, digits, hyphens).`
+        );
+        process.exit(1);
+    }
+
+    // Verify the account exists on GitHub
+    if (!isDryRun) {
+        const verifyResult = exec(
+            `curl -s -o /dev/null -w "%{http_code}" https://api.github.com/users/${githubUser}`
+        );
+        if (verifyResult !== "200") {
+            console.error(
+                `Error: GitHub user "${githubUser}" not found (HTTP ${verifyResult}).`
+            );
+            process.exit(1);
+        }
+    }
+
+    console.log(`GitHub user: ${githubUser} (via ${source})`);
+
+    // Cache in package.json
+    if (source !== "package.json dash.githubUser (cached)") {
+        pkg.dash = pkg.dash || {};
+        pkg.dash.githubUser = githubUser;
+        fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 4) + "\n");
+        console.log(`Cached githubUser "${githubUser}" in package.json`);
+    }
+
+    return githubUser;
 }
+
+// ---------------------------------------------------------------------------
+// gh CLI checks
+// ---------------------------------------------------------------------------
 
 function checkGhCli() {
     const version = exec("gh --version");
@@ -157,9 +336,13 @@ function checkGhCli() {
     }
 }
 
-function buildAndRelease(packageName, version) {
-    const tag = `v${version}`;
-    const zipName = `${packageName}-${tag}.zip`;
+// ---------------------------------------------------------------------------
+// Build and release
+// ---------------------------------------------------------------------------
+
+function buildAndRelease(githubUser, registryName, projectName, version) {
+    const releaseTag = `${githubUser}--${registryName}--v${version}`;
+    const zipName = `${projectName}-v${version}.zip`;
 
     // Always build a fresh ZIP
     console.log(`\nBuilding widget package...`);
@@ -176,36 +359,59 @@ function buildAndRelease(packageName, version) {
         process.exit(1);
     }
 
-    // Try creating a new release
-    console.log(`Uploading ${zipName} to release ${tag}...`);
+    // Upload ZIP to dash-registry releases (not the widget project's own repo)
+    console.log(
+        `\nUploading ${zipName} to ${REGISTRY_REPO} release ${releaseTag}...`
+    );
     const createResult = exec(
-        `gh release create ${tag} "${zipPath}" --generate-notes 2>&1`
+        `gh release create "${releaseTag}" "${zipPath}" --repo ${REGISTRY_REPO} --title "${registryName} v${version}" --notes "Published by ${githubUser}" 2>&1`
     );
 
     if (createResult && !createResult.includes("already exists")) {
-        console.log(`Release ${tag} created.`);
-        return;
+        console.log(`Release ${releaseTag} created on ${REGISTRY_REPO}.`);
+        return releaseTag;
     }
 
     // Release already exists — replace the ZIP asset
-    console.log(`Release ${tag} exists. Replacing asset...`);
+    console.log(`Release ${releaseTag} exists. Replacing asset...`);
     const uploadResult = exec(
-        `gh release upload ${tag} "${zipPath}" --clobber 2>&1`
+        `gh release upload "${releaseTag}" "${zipPath}" --repo ${REGISTRY_REPO} --clobber 2>&1`
     );
     if (!uploadResult || uploadResult.includes("error")) {
-        console.error("Error: Failed to upload ZIP to existing release.");
+        console.error(
+            "Error: Failed to upload ZIP to existing release on dash-registry."
+        );
         console.error(uploadResult);
         process.exit(1);
     }
 
-    console.log(`Release ${tag} updated with fresh ${zipName}.`);
+    console.log(
+        `Release ${releaseTag} updated with fresh ${zipName} on ${REGISTRY_REPO}.`
+    );
+    return releaseTag;
 }
 
-function main() {
+// ---------------------------------------------------------------------------
+// Monorepo support — discover publishable widget folders
+// ---------------------------------------------------------------------------
+
+function discoverWidgetFolders() {
+    if (!fs.existsSync(WIDGETS_DIR)) return [];
+
+    const entries = fs.readdirSync(WIDGETS_DIR, { withFileTypes: true });
+    return entries
+        .filter((e) => e.isDirectory() && !EXCLUDED_DIRS.has(e.name))
+        .map((e) => e.name);
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+async function main() {
     // Read package.json
-    const pkg = JSON.parse(
-        fs.readFileSync(path.join(ROOT, "package.json"), "utf8")
-    );
+    const pkgPath = path.join(ROOT, "package.json");
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
     const projectName = (pkg.name || "widgets").replace(/^@[^/]+\//, "");
     const version = pkg.version || "0.0.0";
     const author =
@@ -215,14 +421,88 @@ function main() {
             ? pkg.repository
             : pkg.repository?.url || "";
 
-    // Detect scope (GitHub username) — needed for manifest even in dry-run
-    const scope = exec("gh api user --jq .login 2>/dev/null");
-    if (!scope && !isDryRun) {
-        checkGhCli(); // will error with helpful message
+    // Check for excluded dirs configuration
+    if (pkg.dash && Array.isArray(pkg.dash.exclude)) {
+        for (const excl of pkg.dash.exclude) {
+            EXCLUDED_DIRS.add(excl);
+        }
     }
 
-    // Collect widget configs
-    const dashConfigPaths = collectDashConfigs(WIDGETS_DIR);
+    // Detect GitHub username via cascade
+    const githubUser = await detectGithubUser(pkg, pkgPath);
+
+    // Discover widget folders for monorepo support
+    const widgetFolders = discoverWidgetFolders();
+
+    if (widgetFolders.length === 0) {
+        console.error("Error: No widget folders found in src/Widgets/");
+        process.exit(1);
+    }
+
+    // Determine which folders to publish
+    let foldersToPublish = widgetFolders;
+    if (targetPackage) {
+        if (!widgetFolders.includes(targetPackage)) {
+            console.error(
+                `Error: Package "${targetPackage}" not found. Available: ${widgetFolders.join(
+                    ", "
+                )}`
+            );
+            process.exit(1);
+        }
+        foldersToPublish = [targetPackage];
+    } else if (!publishAll && widgetFolders.length > 1) {
+        console.log(
+            `\nMultiple widget folders found: ${widgetFolders.join(", ")}`
+        );
+        console.log(
+            "Use --package <name> to publish one, or --all to publish all."
+        );
+        const answer = await prompt(
+            `Publish all ${widgetFolders.length} packages? (y/n): `
+        );
+        if (answer.toLowerCase() !== "y" && answer.toLowerCase() !== "yes") {
+            console.log("Aborted.");
+            process.exit(0);
+        }
+    }
+
+    // Publish each folder
+    for (const folderName of foldersToPublish) {
+        const folderPath = path.join(WIDGETS_DIR, folderName);
+        await publishPackage(
+            folderName,
+            folderPath,
+            githubUser,
+            pkg,
+            projectName,
+            version,
+            author,
+            repository
+        );
+    }
+
+    console.log(
+        "\nDone! Your widgets will appear in the Discover tab once the PR is merged."
+    );
+}
+
+async function publishPackage(
+    folderName,
+    folderPath,
+    githubUser,
+    pkg,
+    projectName,
+    version,
+    author,
+    repository
+) {
+    console.log(`\n${"=".repeat(60)}`);
+    console.log(`Publishing: ${folderName}`);
+    console.log("=".repeat(60));
+
+    // Collect widget configs for this folder
+    const dashConfigPaths = collectDashConfigs(folderPath);
     const widgets = [];
 
     for (const configPath of dashConfigPaths) {
@@ -240,26 +520,17 @@ function main() {
     }
 
     if (widgets.length === 0) {
-        console.error("Error: No widgets found in src/Widgets/");
-        process.exit(1);
+        console.warn(`Warning: No widgets found in ${folderName}, skipping.`);
+        return;
     }
 
     // ── Resolve registryName / registryDisplayName ──────────────────
 
-    let registryName = projectName; // Priority 4: package.json
-    let registryDisplayName = pkg.productName || projectName;
+    // Default: folder name (zero config)
+    let registryName = toKebabCase(folderName);
+    let registryDisplayName = toTitleCase(registryName);
 
-    // Priority 3: Folder name under src/Widgets/
-    const widgetDirs = fs
-        .readdirSync(WIDGETS_DIR, { withFileTypes: true })
-        .filter((e) => e.isDirectory())
-        .map((e) => e.name);
-    if (widgetDirs.length === 1) {
-        registryName = toKebabCase(widgetDirs[0]);
-        registryDisplayName = toTitleCase(registryName);
-    }
-
-    // Priority 2: .dash.js package field
+    // Override: .dash.js package field (if consistent across all widgets)
     const packageNames = [
         ...new Set(widgets.map((w) => w.package).filter(Boolean)),
     ];
@@ -274,7 +545,7 @@ function main() {
         );
     }
 
-    // Priority 1: --name flag (always wins)
+    // Override: --name flag (always wins)
     if (customName) {
         if (!/^[a-z][a-z0-9]*(-[a-z0-9]+)*$/.test(customName)) {
             console.error(
@@ -286,21 +557,25 @@ function main() {
         registryDisplayName = toTitleCase(customName);
     }
 
-    // Strip internal "package" field from widget entries before manifest
-    const manifestWidgets = widgets.map(({ package: _pkg, ...rest }) => rest);
+    // Stamp scoped widget IDs and strip internal "package" field
+    const manifestWidgets = widgets.map(({ package: _pkg, ...rest }) => ({
+        id: `${githubUser}.${registryName}.${rest.name}`,
+        ...rest,
+    }));
 
     // Infer category from tags or default
     const category = "general";
 
-    // Build download URL template (uses projectName for ZIP filename)
-    const repoUrl = repository.replace(/\.git$/, "");
-    const downloadUrl = repoUrl
-        ? `${repoUrl}/releases/download/v{version}/${projectName}-v{version}.zip`
-        : "";
+    // Build download URL pointing to dash-registry releases
+    const releaseTag = `${githubUser}--${registryName}--v{version}`;
+    const downloadUrl = `https://github.com/${REGISTRY_REPO}/releases/download/${releaseTag}/${projectName}-v{version}.zip`;
+
+    // Repository is optional
+    const repoUrl = repository ? repository.replace(/\.git$/, "") : "";
 
     // Generate manifest
     const manifest = {
-        scope: scope || "unknown",
+        githubUser: githubUser,
         name: registryName,
         displayName: registryDisplayName,
         author: author,
@@ -309,14 +584,18 @@ function main() {
         category: category,
         tags: pkg.keywords || [],
         downloadUrl: downloadUrl,
-        repository: repoUrl,
+        ...(repoUrl ? { repository: repoUrl } : {}),
         publishedAt: new Date().toISOString(),
         widgets: manifestWidgets,
     };
 
     console.log("\nGenerated manifest:");
     console.log(JSON.stringify(manifest, null, 2));
-    console.log(`\nWidgets: ${manifestWidgets.map((w) => w.name).join(", ")}`);
+    console.log(
+        `\nWidgets: ${manifestWidgets
+            .map((w) => `${w.name} (${w.id})`)
+            .join(", ")}`
+    );
 
     // Pre-flight schema validation
     const { validateManifestSchema } = require("./validateWidget.cjs");
@@ -341,18 +620,11 @@ function main() {
         return;
     }
 
-    if (!downloadUrl) {
-        console.error(
-            "\nError: Could not determine download URL. Set `repository` in package.json."
-        );
-        process.exit(1);
-    }
-
     // Check gh CLI (needed for release upload and PR creation)
     checkGhCli();
 
-    // Build fresh ZIP and ensure release has latest assets
-    buildAndRelease(projectName, version);
+    // Build fresh ZIP and upload to dash-registry releases
+    buildAndRelease(githubUser, registryName, projectName, version);
 
     console.log("\nPublishing to dash-registry...");
 
@@ -360,15 +632,8 @@ function main() {
     console.log(`Forking ${REGISTRY_REPO}...`);
     exec(`gh repo fork ${REGISTRY_REPO} --clone=false 2>&1`);
 
-    // Get the user's GitHub username (already have scope, but verify for PR)
-    const ghUser = scope;
-    if (!ghUser) {
-        console.error("Error: Could not determine GitHub username.");
-        process.exit(1);
-    }
-
     const branchName = `add-${registryName}`;
-    const manifestPath = `packages/${scope}/${registryName}/manifest.json`;
+    const manifestPath = `packages/${githubUser}/${registryName}/manifest.json`;
     const manifestContent = JSON.stringify(manifest, null, 2);
 
     // Create the manifest file via the GitHub API
@@ -377,10 +642,10 @@ function main() {
     // Get the default branch SHA
     const defaultBranch =
         exec(
-            `gh api repos/${ghUser}/dash-registry --jq .default_branch 2>&1`
+            `gh api repos/${githubUser}/dash-registry --jq .default_branch 2>&1`
         ) || "main";
     const baseSha = exec(
-        `gh api repos/${ghUser}/dash-registry/git/ref/heads/${defaultBranch} --jq .object.sha 2>&1`
+        `gh api repos/${githubUser}/dash-registry/git/ref/heads/${defaultBranch} --jq .object.sha 2>&1`
     );
 
     if (!baseSha) {
@@ -392,13 +657,13 @@ function main() {
 
     // Create branch
     exec(
-        `gh api repos/${ghUser}/dash-registry/git/refs -f ref=refs/heads/${branchName} -f sha=${baseSha} 2>&1`
+        `gh api repos/${githubUser}/dash-registry/git/refs -f ref=refs/heads/${branchName} -f sha=${baseSha} 2>&1`
     );
 
     // Write manifest file via Contents API
     const encodedContent = Buffer.from(manifestContent).toString("base64");
     const createResult = exec(
-        `gh api repos/${ghUser}/dash-registry/contents/${manifestPath} \
+        `gh api repos/${githubUser}/dash-registry/contents/${manifestPath} \
         -X PUT \
         -f message="Add ${registryName} v${version}" \
         -f content="${encodedContent}" \
@@ -408,11 +673,11 @@ function main() {
     if (!createResult || createResult.includes("error")) {
         // File might already exist, try updating
         const existingSha = exec(
-            `gh api repos/${ghUser}/dash-registry/contents/${manifestPath}?ref=${branchName} --jq .sha 2>&1`
+            `gh api repos/${githubUser}/dash-registry/contents/${manifestPath}?ref=${branchName} --jq .sha 2>&1`
         );
         if (existingSha && !existingSha.includes("Not Found")) {
             exec(
-                `gh api repos/${ghUser}/dash-registry/contents/${manifestPath} \
+                `gh api repos/${githubUser}/dash-registry/contents/${manifestPath} \
                 -X PUT \
                 -f message="Update ${registryName} to v${version}" \
                 -f content="${encodedContent}" \
@@ -428,8 +693,11 @@ function main() {
     const prBody = `## New Package: ${manifest.displayName}
 
 **Author:** ${author}
+**GitHub User:** ${githubUser}
 **Version:** ${version}
-**Widgets:** ${manifestWidgets.map((w) => w.displayName || w.name).join(", ")}
+**Widgets:** ${manifestWidgets
+        .map((w) => `${w.displayName || w.name} (\`${w.id}\`)`)
+        .join(", ")}
 
 ${manifest.description}
 
@@ -439,7 +707,7 @@ ${manifest.description}
     const prResult = exec(
         `gh pr create \
         --repo ${REGISTRY_REPO} \
-        --head ${ghUser}:${branchName} \
+        --head ${githubUser}:${branchName} \
         --title "${prTitle}" \
         --body "${prBody.replace(/"/g, '\\"')}" 2>&1`
     );
@@ -452,10 +720,9 @@ ${manifest.description}
             `https://github.com/${REGISTRY_REPO}/pulls`
         );
     }
-
-    console.log(
-        "\nDone! Your widgets will appear in the Discover tab once the PR is merged."
-    );
 }
 
-main();
+main().catch((err) => {
+    console.error(`Fatal: ${err.message}`);
+    process.exit(1);
+});
