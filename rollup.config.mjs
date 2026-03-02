@@ -5,7 +5,7 @@ import postcss from "rollup-plugin-postcss";
 import filesize from "rollup-plugin-filesize";
 import autoprefixer from "autoprefixer";
 import external from "rollup-plugin-peer-deps-external";
-import pkg from "./package.json" assert { type: "json" };
+import pkg from "./package.json" with { type: "json" };
 import typescript from "typescript";
 import ts from "@rollup/plugin-typescript";
 import strip from "@rollup/plugin-strip";
